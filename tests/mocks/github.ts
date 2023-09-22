@@ -2,12 +2,29 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { faker } from '@faker-js/faker'
 import fsExtra from 'fs-extra'
-import { HttpResponse, passthrough, http, type HttpHandler } from 'msw'
-
-const { json } = HttpResponse
+import { rest, 
+	type RequestHandler, 
+	type MockedRequest,
+} from 'msw'
+import { passthrough } from './misc.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const here = (...s: Array<string>) => path.join(__dirname, ...s)
+
+class GithubError extends Error {
+	name: string
+	message: string
+	stack?: string | undefined
+	cause?: unknown
+	status: number
+
+	constructor(name: string, status: number, message: string) {
+		super()
+		this.name = name
+		this.message = message
+		this.status = status
+	}
+}
 
 const githubUserFixturePath = path.join(
 	here(
@@ -101,30 +118,46 @@ export async function insertGitHubUser(code?: string | null) {
 	return user
 }
 
-async function getUser(request: Request) {
-	const accessToken = request.headers
+async function getUser(req: MockedRequest): Promise<GitHubUser> {
+	const accessToken = req.headers
 		.get('authorization')
 		?.slice('token '.length)
-
 	if (!accessToken) {
-		return new Response('Unauthorized', { status: 401 })
+		throw new GithubError('Unauthorized', 401, 'Unauthorized')
 	}
 	const user = (await getGitHubUsers()).find(u => u.accessToken === accessToken)
 
 	if (!user) {
-		return new Response('Not Found', { status: 404 })
+		throw new GithubError('Not Found', 404, 'Not Found')
 	}
 	return user
 }
 
+// async function getUserHandle(req: MockedRequest): Promise<ResponseFunction> {
+// 	const accessToken = req.headers
+// 		.get('authorization')
+// 		?.slice('token '.length)
+	
+// 	const resFn = createResponseComposition
+// 	if (!accessToken) {
+// 		return resFn({status: 401, statusText: 'Unauthorized', body: 'Unauthorized'})
+// 	}
+// 	const user = (await getGitHubUsers()).find(u => u.accessToken === accessToken)
+
+// 	if (!user) {
+// 		return resFn({status: 404, statusText: 'Not Found', body: 'Not Found'})
+// 	}
+// 	return resFn()
+// }
+
 const passthroughGitHub =
 	!process.env.GITHUB_CLIENT_ID.startsWith('MOCK_') && !process.env.TESTING
-export const handlers: Array<HttpHandler> = [
-	http.post(
+export const handlers: Array<RequestHandler> = [
+	rest.post(
 		'https://github.com/login/oauth/access_token',
-		async ({ request }) => {
-			if (passthroughGitHub) return passthrough()
-			const params = new URLSearchParams(await request.text())
+		async (req, res, ctx) => {
+			if (passthroughGitHub) return res(ctx.status(302), ctx.text('Passthrough'))
+			const params = new URLSearchParams(await req.text())
 
 			const code = params.get('code')
 			const githubUsers = await getGitHubUsers()
@@ -133,49 +166,62 @@ export const handlers: Array<HttpHandler> = [
 				user = await insertGitHubUser(code)
 			}
 
-			return new Response(
-				new URLSearchParams({
-					access_token: user.accessToken,
-					token_type: '__MOCK_TOKEN_TYPE__',
-				}).toString(),
-				{ headers: { 'content-type': 'application/x-www-form-urlencoded' } },
+			return res(
+				ctx.set('content-type', 'application/x-www-form-urlencoded')
 			)
+			// return new Response(
+			// 	new URLSearchParams({
+			// 		access_token: user.accessToken,
+			// 		token_type: '__MOCK_TOKEN_TYPE__',
+			// 	}).toString(),
+			// 	{ headers: { } },
+			// )
 		},
 	),
-	http.get('https://api.github.com/user/emails', async ({ request }) => {
+	rest.get('https://api.github.com/user/emails', async (req, res, ctx) => {
 		if (passthroughGitHub) return passthrough()
 
-		const user = await getUser(request)
-		if (user instanceof Response) return user
-
-		return json(user.emails)
+		try {
+			const user = await getUser(req)
+			return res(ctx.json(user.emails))
+		} catch(err) {
+			if (err instanceof GithubError) {
+				return res(ctx.status(err.status), ctx.text(err.message))
+			}
+		}
+		return passthrough()
 	}),
-	http.get('https://api.github.com/user/:id', async ({ params }) => {
+	rest.get('https://api.github.com/user/:id', async (req, res, ctx) => {
 		if (passthroughGitHub) return passthrough()
 
+		const params = req.params
 		const mockUser = (await getGitHubUsers()).find(
 			u => u.profile.id === params.id,
 		)
-		if (mockUser) return json(mockUser.profile)
+		if (mockUser) return res(ctx.json(mockUser.profile))
 
-		return new Response('Not Found', { status: 404 })
+		return res(ctx.status(404), ctx.text('Not Found'))
 	}),
-	http.get('https://api.github.com/user', async ({ request }) => {
+	rest.get('https://api.github.com/user', async (req, res, ctx) => {
 		if (passthroughGitHub) return passthrough()
 
-		const user = await getUser(request)
-		if (user instanceof Response) return user
-
-		return json(user.profile)
+		try {
+			const user = await getUser(req)
+			return res(ctx.json(user.profile))
+		} catch(err) {
+			if (err instanceof GithubError) {
+				return res(ctx.status(err.status), ctx.text(err.message))
+			}
+		}
+		return passthrough()
 	}),
-	http.get('https://github.com/ghost.png', async () => {
+	rest.get('https://github.com/ghost.png', async (req, res, ctx) => {
 		if (passthroughGitHub) return passthrough()
 
 		const buffer = await fsExtra.readFile('./tests/fixtures/github/ghost.jpg')
-		return new Response(buffer, {
-			// the .png is not a mistake even though it looks like it... It's really a jpg
-			// but the ghost image URL really has a png extension 😅
-			headers: { 'content-type': 'image/jpg' },
-		})
+		return res(
+			ctx.set('content-type', 'image/jpg'),
+			ctx.body(buffer)
+		)
 	}),
 ]
